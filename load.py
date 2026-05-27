@@ -141,9 +141,9 @@ actions_frame_ref = None
 main_error_label = None
 
 def show_edmc_error():
-    if main_error_label and main_error_label.winfo_exists():
-        try: main_error_label.after(0, lambda: main_error_label.config(text="Plugin Error: Check log for details."))
-        except Exception: pass
+    # Suppress front-end UI errors to prevent annoying messages
+    # like "can't access xyz folder" when docking at old stations.
+    pass
 
 # -------------------------------------------------------------------------
 # HELPERS & PERSISTENT MEMORY
@@ -157,8 +157,14 @@ def get_cmdr_name():
 
 def clean_station_name(name):
     if not name: return ""
+    name = name.strip()
+
+    # 1. Strip Elite's raw localization tags (e.g., "$EXT_PANEL_ColonisationShip;")
+    name = re.sub(r'^\$[^;]+;\s*', '', name, flags=re.IGNORECASE)
+
+    # 2. Strip the standard text prefixes
     pattern = r"^(system coloni[sz]ation ship|planetary construction site|orbital construction site)[:\-\s]+"
-    return re.sub(pattern, "", name.strip(), flags=re.IGNORECASE).strip()
+    return re.sub(pattern, "", name, flags=re.IGNORECASE).strip()
 
 def save_active_project():
     config.set("RCC_ActiveBuildId", active_project.get("build_id") or "")
@@ -659,7 +665,7 @@ class LinkProjectMenu:
     def __init__(self, parent_frame):
         self.window = tk.Toplevel(parent_frame)
         self.window.title(f"Link Project - {current_system['name']}")
-        self.window.geometry("450x260")
+        self.window.geometry("450x290")
         self.window.attributes("-topmost", True)
         self.window.grab_set()
 
@@ -677,10 +683,13 @@ class LinkProjectMenu:
         tk.Entry(self.window, textvariable=self.market_id_var, width=20, justify="center").pack(pady=(0, 10))
 
         self.browser_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(self.window, text="Auto-open project in browser", variable=self.browser_var).pack(pady=(0, 10))
+        tk.Checkbutton(self.window, text="Auto-open project in browser", variable=self.browser_var).pack(pady=(0, 5))
 
         self.bypass_var = tk.BooleanVar(value=False)
         tk.Checkbutton(self.window, text="Manual Commodity Entry (Bypass Live Sync)", variable=self.bypass_var, fg="#ff7700").pack(pady=(0, 5))
+
+        self.built_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self.window, text="Site is Already Built (Sync & Mark Completed)", variable=self.built_var, fg="#00cc00").pack(pady=(0, 5))
 
         btn_frame = tk.Frame(self.window)
         btn_frame.pack(pady=5)
@@ -734,8 +743,18 @@ class LinkProjectMenu:
         if not selection or selection not in self.site_map: return
         site_data = self.site_map[selection]
         db_market_id = site_data.get("marketId")
-        if db_market_id and str(db_market_id) != "0": self.market_id_var.set(str(db_market_id))
-        else: self.market_id_var.set(str(resolve_market_id(site_data.get("name", ""))))
+
+        if db_market_id and str(db_market_id) != "0":
+            self.market_id_var.set(str(db_market_id))
+        else:
+            resolved_id = resolve_market_id(site_data.get("name", ""))
+            if str(resolved_id) == "0":
+                if monitor and getattr(monitor, 'state', None):
+                    resolved_id = monitor.state.get("MarketID") or 0
+                if str(resolved_id) == "0" and last_docked_station.get("market_id"):
+                    resolved_id = last_docked_station["market_id"]
+
+            self.market_id_var.set(str(resolved_id))
 
     def show_error(self, error_msg):
         self.info_label.config(text=error_msg, fg="#ff4444")
@@ -754,8 +773,16 @@ class LinkProjectMenu:
         manual_id_str = self.market_id_var.get().strip()
         market_id = int(manual_id_str) if manual_id_str.isdigit() else 0
 
+        if market_id == 0:
+            if monitor and getattr(monitor, 'state', None):
+                market_id = int(monitor.state.get("MarketID") or 0)
+            if market_id == 0 and last_docked_station.get("market_id"):
+                market_id = int(last_docked_station["market_id"])
+
         btype = str(site_data.get("buildType", ""))
         clean_name = clean_station_name(site_data.get("name", "Unknown"))
+
+        is_already_built = self.built_var.get()
 
         active_project.update({
             "is_active": True,
@@ -765,11 +792,17 @@ class LinkProjectMenu:
             "system_site_id": site_data.get("id", ""),
             "market_id": market_id,
             "build_id": site_data.get("buildId"),
-            "force_bypass": False,
-            "manual_cargo_dict": {},
+            "force_bypass": self.bypass_var.get() or is_already_built,
+            "is_already_built": is_already_built,
+            "manual_cargo_dict": {} if is_already_built else {},
             "auto_open_browser": self.browser_var.get(),
-            "progress_data": BUILD_CARGO_MAP.get(btype.lower(), {}).copy()
+            "progress_data": {} if is_already_built else BUILD_CARGO_MAP.get(btype.lower(), {}).copy()
         })
+
+        if is_already_built:
+            threading.Thread(target=create_raven_project_api, daemon=True).start()
+            self.window.destroy()
+            return
 
         if self.bypass_var.get():
             base_cargo = BUILD_CARGO_MAP.get(btype.lower(), {}).copy()
@@ -1278,6 +1311,15 @@ def plugin_start3(plugin_dir):
         show_edmc_error()
         return plugin_name
 
+def open_raven_browser():
+    """Opens the active project or current system in the default web browser."""
+    if active_project.get("is_active") and active_project.get("build_id"):
+        webbrowser.open(f"{RCC_UX_BASE}/#build={urllib.parse.quote(str(active_project['build_id']))}")
+    elif current_system.get("name") and current_system.get("name") != "Unknown":
+        webbrowser.open(f"{RCC_UX_BASE}/#sys={urllib.parse.quote(current_system['name'])}")
+    else:
+        trigger_error_popup("Browser Error", "No known system or active project to open.")
+
 def plugin_app(parent):
     global tools_frame_ref, actions_frame_ref, overlay_toggle_var, main_error_label
     try:
@@ -1295,10 +1337,17 @@ def plugin_app(parent):
         cb_overlay.pack(anchor=tk.W, padx=10, pady=5)
 
         actions_frame_ref = tk.LabelFrame(frame, text="Project Actions")
+
         btn_link = tk.Button(actions_frame_ref, text="Link Planned/Active Colony", command=lambda: LinkProjectMenu(frame))
         btn_link.pack(fill=tk.X, padx=10, pady=4)
+
         btn_new = tk.Button(actions_frame_ref, text="Initialize New Colony", command=lambda: NewColonyMenu(frame))
         btn_new.pack(fill=tk.X, padx=10, pady=4)
+
+        # --- NEW BROWSER BUTTON ---
+        btn_browser = tk.Button(actions_frame_ref, text="Open System/Project in Browser", command=open_raven_browser)
+        btn_browser.pack(fill=tk.X, padx=10, pady=4)
+        # --------------------------
 
         if config.get_str("RCC_HideActions") != "1": actions_frame_ref.pack(fill=tk.X, padx=5, pady=5)
 
@@ -1525,12 +1574,29 @@ def create_raven_project_api():
     if build_id:
         headers = {"rcc-key": api_key, "rcc-cmdr": cmdr_name, "Content-Type": "application/json"}
         try:
-            response = session.put(f"{RCC_API_BASE}/api/project/{urllib.parse.quote(build_id)}/link/{urllib.parse.quote(cmdr_name)}", headers=headers, timeout=10)
+            response = session.put(f"{RCC_API_BASE}/api/project/{urllib.parse.quote(build_id)}/link/{urllib.parse.quote(cmdr_name)}", headers=headers, timeout=45)
             if response.status_code in [200, 201, 204]:
                 save_active_project()
-                if latest_market_data["market_id"] == active_project["market_id"] and latest_market_data["demands"] and not active_project.get("force_bypass"):
+
+                # Handle "Already Built" logic for an existing project
+                if active_project.get("is_already_built"):
+                    threading.Thread(target=sync_live_market_to_server, args=(build_id, {}), daemon=True).start()
+                    if site_id:
+                        raw_body = str(active_project["target_body"]).strip()
+                        if raw_body:
+                            if current_system['name'] != "Unknown" and not raw_body.lower().startswith(current_system['name'].lower()):
+                                body_name_str = f"{current_system['name']} {raw_body}"
+                            else: body_name_str = raw_body
+                        else: body_name_str = current_system['name']
+                        b_num = int(raw_body) if raw_body.isdigit() else 0
+
+                        update_payload = {"update": [{"id": str(site_id), "name": str(active_project["name"]), "bodyNum": b_num if b_num >= 0 else 0, "bodyName": body_name_str, "buildType": str(active_project["build_type"]), "buildId": str(build_id), "status": "completed"}], "delete": [], "architect": cmdr_name}
+                        session.put(f"{RCC_API_BASE}/api/v2/system/{urllib.parse.quote(current_system['name'])}/sites", json=update_payload, headers=headers, timeout=10)
+
+                elif latest_market_data["market_id"] == active_project["market_id"] and latest_market_data["demands"] and not active_project.get("force_bypass"):
                     active_project["progress_data"] = latest_market_data["demands"]
                     threading.Thread(target=sync_live_market_to_server, args=(build_id, latest_market_data["demands"]), daemon=True).start()
+
                 if hud_instance:
                     hud_instance.update_status(f"Joined Project: {active_project['name']} ✓", force_show=True)
                     threading.Thread(target=fetch_project_progress, daemon=True).start()
@@ -1556,12 +1622,17 @@ def create_raven_project_api():
 
         if market_id != 0 and latest_market_data["market_id"] == market_id and latest_market_data["demands"]: has_live = True
 
-        if active_project.get("force_bypass") and active_project.get("manual_cargo_dict"):
+        if active_project.get("force_bypass") and active_project.get("manual_cargo_dict") is not None:
             has_live = True
             cargo_dict = active_project["manual_cargo_dict"].copy()
 
+        if active_project.get("is_already_built"):
+            has_live = True
+            cargo_dict = {}
+
         if has_live:
-            if not active_project.get("force_bypass"): cargo_dict = latest_market_data["demands"].copy()
+            if not active_project.get("force_bypass") and not active_project.get("is_already_built"):
+                cargo_dict = latest_market_data["demands"].copy()
         else:
             trigger_error_popup("Missing Live Market Data", "To capture the exact commodity requirements, you MUST physically dock and view the market board in-game BEFORE linking a new planned colony.")
             if hud_instance: hud_instance.update_status("Fail: Open Market First", force_show=True)
@@ -1570,7 +1641,15 @@ def create_raven_project_api():
         max_need = sum(cargo_dict.values()) if cargo_dict else 1
 
         raw_body = str(active_project["target_body"]).strip()
-        body_name_str = raw_body if raw_body else current_system['name']
+
+        if raw_body:
+            if current_system['name'] != "Unknown" and not raw_body.lower().startswith(current_system['name'].lower()):
+                body_name_str = f"{current_system['name']} {raw_body}"
+            else:
+                body_name_str = raw_body
+        else:
+            body_name_str = current_system['name']
+
         b_num = int(raw_body) if raw_body.isdigit() else 0
 
         payload = {
@@ -1584,7 +1663,7 @@ def create_raven_project_api():
         if site_id: payload["systemSiteId"] = str(site_id)
         headers = {"rcc-key": api_key, "rcc-cmdr": cmdr_name, "Content-Type": "application/json"}
 
-        response = session.put(f"{RCC_API_BASE}/api/project/", json=payload, headers=headers, timeout=10)
+        response = session.put(f"{RCC_API_BASE}/api/project/", json=payload, headers=headers, timeout=45)
         if response.status_code in [200, 201]:
             response_data = response.json()
             build_id = response_data.get("buildId", "")
@@ -1596,7 +1675,8 @@ def create_raven_project_api():
                 threading.Thread(target=fetch_project_progress, daemon=True).start()
 
             if build_id and site_id:
-                update_payload = {"update": [{"id": str(site_id), "name": str(active_project["name"]), "bodyNum": b_num if b_num >= 0 else 0, "bodyName": body_name_str, "buildType": str(btype), "buildId": str(build_id), "status": "build"}], "delete": [], "architect": cmdr_name}
+                status_val = "completed" if active_project.get("is_already_built") else "build"
+                update_payload = {"update": [{"id": str(site_id), "name": str(active_project["name"]), "bodyNum": b_num if b_num >= 0 else 0, "bodyName": body_name_str, "buildType": str(btype), "buildId": str(build_id), "status": status_val}], "delete": [], "architect": cmdr_name}
                 session.put(f"{RCC_API_BASE}/api/v2/system/{urllib.parse.quote(current_system['name'])}/sites", json=update_payload, headers=headers, timeout=10)
 
             if active_project["auto_open_browser"]:
